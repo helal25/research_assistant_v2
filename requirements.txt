@@ -1,0 +1,13 @@
+langgraph
+langgraph-cli[inmem]
+langchain-core
+langchain-openai
+langchain-tavily
+langchain-text-splitters
+arxiv
+pypdf
+beautifulsoup4
+requests
+python-dotenv
+pydantic
+colorama
