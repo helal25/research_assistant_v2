@@ -56,7 +56,7 @@ Analyze the user's input and produce a structured execution plan. Deconstruct th
 """
 
 llm_subquery=ChatOpenAI(model='gpt-4o-mini')
-llm_drafting=ChatOpenAI(model='gpt-5.6-luna')
+llm_drafting=ChatOpenAI(model='gpt-4o')
 
 
 class SubInput(BaseModel):
@@ -68,7 +68,6 @@ class SubState(BaseModel):
     arxiv_queries: Annotated[list[str], operator.add] = Field(default_factory=list,description="Subqueries destined for the arxiv search node.")
     tavily_results: Annotated[list[str], operator.add] = Field(default_factory=list)
     tavily_queries: Annotated[list[str], operator.add] = Field(default_factory=list, description="Subqueries destined for the tavily search node.")
-    results: Annotated[list[str], operator.add] = Field(default_factory=list, description="Retrieved arXiv RAG results.")
     arxiv_results: Annotated[list[str], operator.add] = Field(default_factory=list, description="Retrieved arXiv RAG results.")
     url_list: Annotated[list[str], operator.add] = Field(default_factory=list, description="List of retrieved paper URLs.")
     draft: str = Field(default="", description="Initial synthesized research draft")
@@ -159,8 +158,6 @@ def arxiv_search(state: RAGState) -> dict:
     clean_query = state.subquery.replace('"', '').strip()
     urls = []
     docs = []
-
-    # Serialize access across LangGraph parallel Send tasks
     with _arxiv_lock:
         now = time.time()
         elapsed = now - _last_arxiv_request_time
@@ -214,7 +211,6 @@ def load_pdfs(state: RAGState) -> dict:
     loaded_docs = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # Limit to top 2 URLs to keep download time and latency low
     target_urls = state.url_list[:2] if state.url_list else []
     
     for url in target_urls:
@@ -249,8 +245,6 @@ def load_pdfs(state: RAGState) -> dict:
                     ))
         except Exception as e:
             logger.warning(f"Failed to download/parse PDF from {url}: {e}")
-
-    # Fallback: if no full PDFs could be loaded, retain the abstracts already in state.docs
     if not loaded_docs and state.docs:
         loaded_docs = state.docs
 
@@ -271,7 +265,7 @@ def splitters(state: RAGState) -> dict:
 def run_retriever(state: RAGState) -> dict:
     """Indexes chunks, retrieves relevant sections, and returns matches to 'results'."""
     if not state.doc_splits:
-        return {"results": [], "arxiv_results": [], "url_list": state.url_list}
+        return {"arxiv_results": [], "url_list": state.url_list}
 
     vectorstore = InMemoryVectorStore.from_documents(
         documents=state.doc_splits,
@@ -284,8 +278,11 @@ def run_retriever(state: RAGState) -> dict:
         f"ArXiv Match [{doc.metadata.get('source', 'Unknown')}]:\n{doc.page_content}"
         for doc in matched_docs
     ]
-    return {"results": extracted_snippets, "arxiv_results": extracted_snippets, "url_list": state.url_list}
+    return {"arxiv_results": extracted_snippets, "url_list": state.url_list}
 
+def collector(state: SubState) -> dict:
+    """Barrier synchronization node that waits for all parallel Send tasks to complete."""
+    return {}
 def drafter(state: SubState) -> dict:
     DRAFTER_SYSTEM_PROMPT = """You are a Principal Scientific Research Synthesizer.
 Your objective is to produce a detailed, technically rigorous preliminary draft addressing the user's research topic.
@@ -385,6 +382,7 @@ graph = StateGraph(SubState, input_schema=SubInput)
 graph.add_node("subquery", sub_query)
 graph.add_node("web_search", web_search)
 graph.add_node("arxiv", call_arxiv_subgraph)
+graph.add_node("collector", collector)
 graph.add_node("drafter", drafter)
 graph.add_node("finalizer", finalizer)
 graph.add_edge(START, "subquery")
@@ -396,7 +394,8 @@ graph.add_conditional_edges(
 )
 
 graph.add_edge("web_search", 'drafter')
-graph.add_edge("arxiv", 'drafter')
+graph.add_edge("arxiv", 'collector')
+graph.add_edge("collector", "drafter")
 graph.add_edge('drafter', 'finalizer')
 graph.add_edge('finalizer', END)
 
